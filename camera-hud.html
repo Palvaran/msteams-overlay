@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Camera HUD</title>
+<!--
+  Camera HUD — a live location / time / weather overlay for your webcam.
+
+  HOW TO USE
+  1. Edit CONFIG below (or leave the defaults).
+  2. In OBS: add a "Browser" source, tick "Local file", pick this file,
+     and set Width/Height to your canvas size (e.g. 1920 x 1080).
+  3. Double-click this file to preview it in a normal browser first —
+     outside OBS it shows a grey stand-in background so you can see it.
+
+  Data sources (free, no API key):
+    Weather + place lookup: Open-Meteo (open-meteo.com)
+    Automatic location:     ipapi.co, falling back to ipwho.is (by IP address)
+-->
+<style>
+  :root {
+    --scale: 1;
+    --font: calc(3.1vh * var(--scale));
+    --margin-x: 6vw;   /* Teams crops video tiles at the sides; keep away from the edges */
+    --margin-y: 6vh;
+    --card-bg: rgba(14, 16, 20, 0.66);
+    --card-border: rgba(255, 255, 255, 0.14);
+    --text: #ffffff;
+  }
+  html, body {
+    margin: 0;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    background: transparent;
+    font-family: -apple-system, "SF Pro Display", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  }
+  /* Only used when previewing outside OBS */
+  body.preview {
+    background: linear-gradient(135deg, #5b6574 0%, #2f3640 60%, #1e2329 100%);
+  }
+  #hud {
+    position: absolute;
+    display: flex;
+    flex-direction: column;
+    gap: 0.32em;
+    padding: 0.7em 1.05em;
+    border-radius: 0.65em;
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    box-shadow: 0 0.25em 1.1em rgba(0, 0, 0, 0.35);
+    color: var(--text);
+    font-size: var(--font);
+    line-height: 1.15;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+    transition: opacity 0.6s ease;
+  }
+  #hud.hidden { opacity: 0; }
+  .top-left     { top: var(--margin-y);    left: var(--margin-x); }
+  .top-right    { top: var(--margin-y);    right: var(--margin-x); }
+  .bottom-left  { bottom: var(--margin-y); left: var(--margin-x); }
+  .bottom-right { bottom: var(--margin-y); right: var(--margin-x); }
+  .row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5em;
+    white-space: nowrap;
+  }
+  .row[hidden] { display: none; }
+  .icon { width: 1.25em; text-align: center; flex: none; }
+  .cond { opacity: 0.78; font-size: 0.82em; }
+  .temp { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .time { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div id="hud" class="hidden">
+  <div class="row" id="row-location"><span class="icon">📍</span><span id="location"></span></div>
+  <div class="row" id="row-time"><span class="icon">🕒</span><span class="time" id="time"></span></div>
+  <div class="row" id="row-weather" hidden>
+    <span class="icon" id="wx-icon">🌡️</span>
+    <span class="temp" id="temp"></span>
+    <span class="cond" id="cond"></span>
+  </div>
+</div>
+
+<script>
+/* ============================  CONFIG  ============================ */
+const CONFIG = {
+  // "auto"  = look up your location from your internet connection (a VPN will change it)
+  // or a place name, e.g. "Houston, Texas" or "London, United Kingdom"
+  // or coordinates, e.g. "29.7604, -95.3698"
+  location: "auto",
+
+  // Optional text to show instead of the looked-up place name, e.g. "Houston, TX"
+  label: "",
+
+  units: "F",                  // "F" or "C"
+  clock24h: false,             // true for 14:05, false for 2:05 PM
+  timeZone: "location",        // "location" = time at the shown place, "system" = your Mac's clock
+  position: "bottom-right",    // top-left | top-right | bottom-left | bottom-right
+  scale: 1,                    // 0.8 = smaller, 1.3 = larger
+
+  show: {
+    location: true,
+    time: true,
+    temperature: true,
+    conditions: true,          // "Partly cloudy" text next to the temperature
+  },
+
+  weatherRefreshMinutes: 15,
+  locationRefreshMinutes: 60,  // only matters for "auto" (picks up travel)
+};
+/* ================================================================== */
+
+// Optional overrides via URL, e.g. camera-hud.html?location=Austin,%20Texas&units=C&pos=top-left
+(function applyQueryOverrides() {
+  const p = new URLSearchParams(location.search);
+  if (p.get("location")) CONFIG.location = p.get("location");
+  if (p.get("label")) CONFIG.label = p.get("label");
+  if (p.get("units")) CONFIG.units = p.get("units");
+  if (p.get("pos")) CONFIG.position = p.get("pos");
+  if (p.get("scale")) CONFIG.scale = parseFloat(p.get("scale")) || 1;
+  if (p.get("h24")) CONFIG.clock24h = p.get("h24") === "1";
+})();
+
+const el = {
+  hud: document.getElementById("hud"),
+  rowLocation: document.getElementById("row-location"),
+  rowTime: document.getElementById("row-time"),
+  rowWeather: document.getElementById("row-weather"),
+  location: document.getElementById("location"),
+  time: document.getElementById("time"),
+  wxIcon: document.getElementById("wx-icon"),
+  temp: document.getElementById("temp"),
+  cond: document.getElementById("cond"),
+};
+
+const state = { place: null, tz: null, temp: null, code: null, isDay: true };
+
+// --- Setup -----------------------------------------------------------
+if (!window.obsstudio) document.body.classList.add("preview");
+document.documentElement.style.setProperty("--scale", CONFIG.scale);
+el.hud.classList.add(CONFIG.position);
+el.rowLocation.hidden = !CONFIG.show.location;
+el.rowTime.hidden = !CONFIG.show.time;
+if (CONFIG.label) el.location.textContent = CONFIG.label;
+
+// --- Helpers ---------------------------------------------------------
+async function getJSON(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  return res.json();
+}
+
+// WMO weather codes used by Open-Meteo -> [day icon, night icon, text]
+const WMO = {
+  0: ["☀️", "🌙", "Clear"],
+  1: ["🌤️", "🌙", "Mostly clear"],
+  2: ["⛅", "☁️", "Partly cloudy"],
+  3: ["☁️", "☁️", "Overcast"],
+  45: ["🌫️", "🌫️", "Fog"],
+  48: ["🌫️", "🌫️", "Freezing fog"],
+  51: ["🌦️", "🌧️", "Light drizzle"],
+  53: ["🌦️", "🌧️", "Drizzle"],
+  55: ["🌧️", "🌧️", "Heavy drizzle"],
+  56: ["🌧️", "🌧️", "Freezing drizzle"],
+  57: ["🌧️", "🌧️", "Freezing drizzle"],
+  61: ["🌦️", "🌧️", "Light rain"],
+  63: ["🌧️", "🌧️", "Rain"],
+  65: ["🌧️", "🌧️", "Heavy rain"],
+  66: ["🌧️", "🌧️", "Freezing rain"],
+  67: ["🌧️", "🌧️", "Freezing rain"],
+  71: ["🌨️", "🌨️", "Light snow"],
+  73: ["🌨️", "🌨️", "Snow"],
+  75: ["❄️", "❄️", "Heavy snow"],
+  77: ["🌨️", "🌨️", "Snow grains"],
+  80: ["🌦️", "🌧️", "Showers"],
+  81: ["🌧️", "🌧️", "Showers"],
+  82: ["⛈️", "⛈️", "Heavy showers"],
+  85: ["🌨️", "🌨️", "Snow showers"],
+  86: ["🌨️", "🌨️", "Snow showers"],
+  95: ["⛈️", "⛈️", "Thunderstorm"],
+  96: ["⛈️", "⛈️", "Thunderstorm, hail"],
+  99: ["⛈️", "⛈️", "Thunderstorm, hail"],
+};
+
+// --- Location --------------------------------------------------------
+async function placeFromIP() {
+  try {
+    const d = await getJSON("https://ipapi.co/json/");
+    if (typeof d.latitude === "number") {
+      return { name: [d.city, d.region].filter(Boolean).join(", "), lat: d.latitude, lon: d.longitude };
+    }
+  } catch (e) { console.warn("ipapi.co failed", e); }
+  const d = await getJSON("https://ipwho.is/");
+  if (d.success === false) throw new Error("IP lookup failed: " + d.message);
+  return { name: [d.city, d.region].filter(Boolean).join(", "), lat: d.latitude, lon: d.longitude };
+}
+
+async function placeFromName(text) {
+  const parts = text.split(",").map(s => s.trim()).filter(Boolean);
+  const name = parts[0];
+  const qualifier = parts.slice(1).join(", ").toLowerCase();
+  const d = await getJSON(
+    "https://geocoding-api.open-meteo.com/v1/search?count=10&language=en&format=json&name=" +
+      encodeURIComponent(name)
+  );
+  const results = d.results || [];
+  if (!results.length) throw new Error(`Couldn't find a place called "${text}"`);
+  const match =
+    (qualifier &&
+      results.find(r =>
+        [r.admin1, r.country, r.country_code].some(v => v && v.toLowerCase().startsWith(qualifier))
+      )) ||
+    results[0];
+  return {
+    name: [match.name, match.admin1 || match.country].filter(Boolean).join(", "),
+    lat: match.latitude,
+    lon: match.longitude,
+  };
+}
+
+async function resolvePlace() {
+  const loc = String(CONFIG.location).trim();
+  const coords = loc.match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
+  if (coords) return { name: CONFIG.label || "", lat: +coords[1], lon: +coords[2] };
+  if (loc.toLowerCase() === "auto") return placeFromIP();
+  return placeFromName(loc);
+}
+
+async function refreshPlace() {
+  try {
+    state.place = await resolvePlace();
+    if (!CONFIG.label) el.location.textContent = state.place.name;
+    reveal();
+    return true;
+  } catch (e) {
+    console.warn(e);
+    return false;
+  }
+}
+
+// --- Weather ---------------------------------------------------------
+async function refreshWeather() {
+  if (!state.place) return false;
+  const unit = String(CONFIG.units).toUpperCase() === "C" ? "celsius" : "fahrenheit";
+  try {
+    const d = await getJSON(
+      `https://api.open-meteo.com/v1/forecast?latitude=${state.place.lat}&longitude=${state.place.lon}` +
+        `&current=temperature_2m,weather_code,is_day&temperature_unit=${unit}&timezone=auto`
+    );
+    state.temp = Math.round(d.current.temperature_2m);
+    state.code = d.current.weather_code;
+    state.isDay = d.current.is_day === 1;
+    state.tz = d.timezone || null;
+    renderWeather();
+    renderTime();
+    return true;
+  } catch (e) {
+    console.warn(e);
+    return false; // keep showing the last good reading
+  }
+}
+
+function renderWeather() {
+  if (!CONFIG.show.temperature || state.temp === null) return;
+  const [dayIcon, nightIcon, text] = WMO[state.code] || ["🌡️", "🌡️", ""];
+  el.wxIcon.textContent = state.isDay ? dayIcon : nightIcon;
+  el.temp.textContent = `${state.temp}°${String(CONFIG.units).toUpperCase() === "C" ? "C" : "F"}`;
+  el.cond.textContent = CONFIG.show.conditions ? text : "";
+  el.rowWeather.hidden = false;
+}
+
+// --- Clock -----------------------------------------------------------
+function renderTime() {
+  if (!CONFIG.show.time) return;
+  const opts = { hour: "numeric", minute: "2-digit", hour12: !CONFIG.clock24h, timeZoneName: "short" };
+  if (CONFIG.timeZone === "location" && state.tz) opts.timeZone = state.tz;
+  let text;
+  try {
+    text = new Intl.DateTimeFormat(undefined, opts).format(new Date());
+  } catch {
+    delete opts.timeZone;
+    text = new Intl.DateTimeFormat(undefined, opts).format(new Date());
+  }
+  if (el.time.textContent !== text) el.time.textContent = text;
+}
+
+function reveal() { el.hud.classList.remove("hidden"); }
+
+// --- Start -----------------------------------------------------------
+async function cycle() {
+  const placeOK = await refreshPlace();
+  const wxOK = placeOK && (await refreshWeather());
+  return placeOK && wxOK;
+}
+
+(async function start() {
+  renderTime();
+  setInterval(renderTime, 1000);
+  if (CONFIG.label || !CONFIG.show.location) reveal();
+
+  // First load: retry every minute until it works (e.g. Wi-Fi not up yet).
+  while (!(await cycle())) {
+    reveal();
+    await new Promise(r => setTimeout(r, 60 * 1000));
+  }
+
+  setInterval(refreshWeather, CONFIG.weatherRefreshMinutes * 60 * 1000);
+  if (String(CONFIG.location).toLowerCase() === "auto") {
+    setInterval(async () => { if (await refreshPlace()) refreshWeather(); },
+                CONFIG.locationRefreshMinutes * 60 * 1000);
+  }
+})();
+</script>
+</body>
+</html>
